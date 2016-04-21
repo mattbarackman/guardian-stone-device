@@ -1,7 +1,7 @@
 
+#include "TinyGPS.h"
 #include "AssetTracker.h"
-
-
+#include "math.h"
 
 /*BEGIN SWITCH DECLARATIONS */
 const int switchPin = D3;
@@ -16,10 +16,11 @@ const int TRIGGERING = 1;
 const int ALERTING = 2;
 
 int buttonState = 0;
-long offTime;
+long fallTime;
 int prevStatus = SITTING;
 int on = 1;
-int power = 10;
+int remPower = 100;
+int gpsIsOn = 0;
 
 /*END SWITCH DECLARATIONS*/
 
@@ -32,13 +33,23 @@ int power = 10;
 int transmittingData = 1;
 
 // Used to keep track of the last time we published data
-long lastPublish = 0;
+long lastPublish;
 
 // How many minutes between publishes? 10+ recommended for long-time continuous publishing!
-int delayMinutes = 10;
+int delayMinutes = 2;
 
-// Creating an AssetTracker named 't' for us to reference
+char lastLoc[64];
+float prevLat = 0.0;
+float prevLon = 0.0;
+
 AssetTracker t = AssetTracker();
+
+/* This sample code demonstrates the normal use of a TinyGPS object.
+   It requires the use of SoftwareSerial, and assumes that you have a
+   4800-baud serial GPS device hooked up on pins 4(rx) and 3(tx).
+*/
+
+TinyGPS tgps;
 
 // A FuelGauge named 'fuel' for checking on the battery state
 FuelGauge fuel;
@@ -48,9 +59,8 @@ FuelGauge fuel;
 void setup() {
   // Opens up a Serial port so you can listen over USB
   Serial.begin(9600);
-  Particle.variable("on", on);
-  Particle.variable("power", on);
-  on = 1;
+  Particle.variable("O", on);
+  Particle.variable("P", remPower);
   Particle.function("turnon", turnOn);
   Particle.function("turnoff", turnOff);
   switchSetup();
@@ -58,28 +68,28 @@ void setup() {
 }
 
 void gpsSetup() {
-  // These three functions are useful for remote diagnostics. Read more below.
-  Particle.function("tmode", transmitMode);
-  Particle.function("gps", gpsPublish);
-  // Sets up all the necessary AssetTracker bits
   t.begin();
-  // Enable the GPS module. Defaults to off to save power.
-  // Takes 1.5s or so because of delays.
   t.gpsOn();
+  gpsIsOn = 1;
+  Particle.function("tmode", transmitMode);
+  Particle.variable("L", lastLoc);
+  Particle.variable("T", lastPublish);
 }
 
 int turnOn(String command) {
   t.gpsOn();
+  gpsIsOn = 1;
   on = 1;
-  offTime = Time.now();
+  fallTime = Time.now();
   prevStatus = SITTING;
   return 1;
 }
 
 int turnOff(String command) {
   t.gpsOff();
+  gpsIsOn = 0;
   on = 0;
-  offTime = Time.now();
+  fallTime = Time.now();
   analogWrite(RED_PIN, 0);
   analogWrite(BLUE_PIN, 0);
   analogWrite(GREEN_PIN, 0);
@@ -87,18 +97,21 @@ int turnOff(String command) {
 }
 
 void switchSetup() {
+  fallTime = Time.now();
   pinMode(RED_PIN, OUTPUT);
   pinMode(GREEN_PIN, OUTPUT);
   pinMode(BLUE_PIN, OUTPUT);
   pinMode(switchPin, INPUT);
-  Particle.function("batt", batteryStatus);
 }
 
 void loop() {
   if (on == 1) {
+    if ((millis() % 1000L) <= 10L){
+      Serial.println("tick");
+    }
     switchLoop();
-    gpsLoop();
-    /*batteryLoop();*/
+    tinyGPSLoop();
+    batteryLoop();
   }
 }
 
@@ -122,41 +135,73 @@ void switchLoop() {
 }
 
 bool delayPassed() {
-  return millis()-lastPublish > delayMinutes*60*1000;
+  /*return true;*/
+  return Time.now()-lastPublish > delayMinutes*60;
 }
 
-void gpsLoop() {
-    // You'll need to run this every loop to capture the GPS output
-  t.updateGPS();
+void tinyGPSLoop() {
 
-  // if the current time - the last time we published is greater than your set delay...
-  if(delayPassed()){
-      // Remember when we published
-      lastPublish = millis();
+  bool isValidGPS = false;
+  char gpsLoc[64];
 
-      //String pubAccel = String::format("%d,%d,%d",t.readX(),t.readY(),t.readZ());
-      //Serial.println(pubAccel);
-      //Particle.publish("A", pubAccel, 60, PRIVATE);
+  if ((millis() % 1000L) <= 10L){
+    if (gpsIsOn){
+      Serial.println("gpsIsOn");
+    }
+  }
 
-      // Dumps the full NMEA sentence to serial in case you're curious
-      Serial.println(t.preNMEA());
+  if (delayPassed()){
 
-      // GPS requires a "fix" on the satellites to give good data,
-      // so we should only publish data if there's a fix
-      if(t.gpsFix()){
-          // Only publish if we're in transmittingData mode 1;
-          if(transmittingData){
-              // Short publish names save data!
-              Particle.publish("G", t.readLatLon(), 60, PRIVATE);
-          }
-          // but always report the data over serial for local development
-          Serial.println(t.readLatLon());
+    /*if ((millis() % 1000L) <= 10L){
+      Serial.println("gps_loop");
+    }*/
+
+    if (gpsIsOn == 0) {
+      /*Serial.println("turn gps on");*/
+      t.gpsOn();
+      /*Serial.println("turn gps on done");*/
+      gpsIsOn = 1;
+    }
+
+    char c = t.checkGPS();
+    int b = tgps.encode(c);
+    if (b){
+      isValidGPS = true;
+    }
+
+    if (isValidGPS){
+      float lat, lon, dis;
+      unsigned long age;
+
+      tgps.f_get_position(&lat, &lon, &age);
+
+      sprintf(gpsLoc, "%.6f,%.6f", (lat == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : lat), (lon == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : lon));
+
+      if(gpsLoc != "0.0,0.0"){
+        // update cloud variable();
+        lastPublish = Time.now();
+        dis = distance(prevLat, prevLon, lat, lon);
+        /*Serial.println(dis);*/
+        if (dis >= 100){
+          /*Serial.println("setting new coords");*/
+          prevLat = lat;
+          prevLon = lon;
+          strncpy(lastLoc, gpsLoc, 64);
+        } else {
+          /*Serial.println("too close");*/
+        }
+        // update cloud variable();
+        /*Serial.println("turn gps off");*/
+        t.gpsOff();
+        /*Serial.println("turn gps off done");*/
+        gpsIsOn = 0;
       }
+    }
+
   }
 }
 
 bool onChair() {
-  Serial.println(digitalRead(switchPin));
   if (digitalRead(switchPin) == LOW) {
     return true;
   } else {
@@ -174,10 +219,10 @@ int status() {
   }
 
   if (prevStatus == SITTING) {
-    offTime = Time.now();
+    fallTime = Time.now();
   }
 
-  long et = elapsedTime(offTime);
+  long et = elapsedTime(fallTime);
 
   if (et <= 5) {
     return TRIGGERING;
@@ -232,38 +277,21 @@ int transmitMode(String command){
     return 1;
 }
 
-// Actively ask for a GPS reading if you're impatient. Only publishes if there's
-// a GPS fix, otherwise returns '0'
-int gpsPublish(String command){
-    if(t.gpsFix()){
-        Particle.publish("G", t.readLatLon(), 60, PRIVATE);
-
-        // uncomment next line if you want a manual publish to reset delay counter
-        // lastPublish = millis();
-        return 1;
-    }
-    else { return 0; }
-}
-
 void batteryLoop(){
-  if (batteryChanged()) {
-    power = fuel.getSoC() / 10;
-    publishBatteryStatus();
+  int locPower = trunc((fuel.getSoC()) / 5 ) * 5;
+  if (batteryChanged(locPower)) {
+    remPower = locPower;
   }
 }
 
-bool batteryChanged(){
-  power != fuel.getSoC() / 10
+bool batteryChanged(int lp){
+  return lp != remPower;
 }
 
-// Lets you remotely check the battery status by calling the function "batt"
-// Triggers a publish with the info (so subscribe or watch the dashboard)
-// and also returns a '1' if there's >10% battery left and a '0' if below
-int batteryStatus(String command){
-    publishBatteryStatus();
-    return fuel.getSoC() / 10;
-}
-
-void publishBatteryStatus(){
-  Particle.publish("power", power, 16777215);
+float distance(float lat1, float lon1, float lat2, float lon2){
+  float dlon = lon2 - lon1;
+  float dlat = lat2 - lat1;
+  float a = pow((sin(dlat/2)), 2) + cos(lat1) * cos(lat2) * pow((sin(dlon/2)), 2);
+  float c = 2.0 * atan2(sqrt(a), sqrt(1-a));
+  return 6371000.0 * c;
 }
